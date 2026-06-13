@@ -1,10 +1,14 @@
 {
-  "name": "role-bot",
+  "name": "roblox-verify-bot",
   "version": "1.0.0",
+  "description": "Discord Bot – Roblox Gamepass Verifikation",
   "main": "index.js",
-  "scripts": { "start": "node index.js" },
+  "scripts": {
+    "start": "node index.js"
+  },
   "dependencies": {
     "discord.js": "^14.14.1",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "node-fetch": "^2.7.0"
   }
 }
