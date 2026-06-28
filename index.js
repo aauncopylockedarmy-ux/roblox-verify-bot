@@ -42,6 +42,75 @@ function generateCode() {
   return code;
 }
 
+// ─── Duration Parsing ─────────────────────────────────────────────────────────
+function parseDuration(str) {
+  if (!str || str.toLowerCase() === 'permanent' || str.toLowerCase() === 'forever') {
+    return null; // null = permanent
+  }
+  const match = str.match(/^(\d+)(s|m|h|d|w)$/i);
+  if (!match) return undefined; // undefined = invalid
+  const value = parseInt(match[1]);
+  const unit = match[2].toLowerCase();
+  const multipliers = { s: 1000, m: 60000, h: 3600000, d: 86400000, w: 604800000 };
+  return value * multipliers[unit];
+}
+
+function formatDuration(ms) {
+  if (ms === null) return 'Permanent';
+  const s = ms / 1000;
+  if (s < 60) return `${Math.round(s)} second(s)`;
+  if (s < 3600) return `${Math.round(s / 60)} minute(s)`;
+  if (s < 86400) return `${Math.round(s / 3600)} hour(s)`;
+  if (s < 604800) return `${Math.round(s / 86400)} day(s)`;
+  return `${Math.round(s / 604800)} week(s)`;
+}
+
+// ─── VIP Timer System ─────────────────────────────────────────────────────────
+const TIMERS_FILE = './vip_timers.json';
+
+function loadTimers() {
+  if (!fs.existsSync(TIMERS_FILE)) return [];
+  return JSON.parse(fs.readFileSync(TIMERS_FILE, 'utf8'));
+}
+function saveTimers(timers) {
+  fs.writeFileSync(TIMERS_FILE, JSON.stringify(timers, null, 2));
+}
+
+function scheduleRoleRemoval(guildId, userId, roleId, expiresAt) {
+  const delay = expiresAt - Date.now();
+  if (delay <= 0) { removeRoleNow(guildId, userId, roleId); return; }
+  setTimeout(() => removeRoleNow(guildId, userId, roleId), delay);
+}
+
+async function removeRoleNow(guildId, userId, roleId) {
+  try {
+    const guild = client.guilds.cache.get(guildId);
+    if (!guild) return;
+    const member = await guild.members.fetch(userId).catch(() => null);
+    if (!member) return;
+    const role = guild.roles.cache.get(roleId);
+    if (!role) return;
+
+    if (member.roles.cache.has(roleId)) {
+      await member.roles.remove(role);
+      console.log(`[VIP TIMER] Removed role ${role.name} from ${member.user.tag}`);
+      try {
+        await member.user.send({
+          embeds: [new EmbedBuilder()
+            .setColor(0xe74c3c)
+            .setTitle('⏰ VIP Expired')
+            .setDescription(`Your **${role.name}** role has expired and been removed.`)
+            .setTimestamp()]
+        });
+      } catch {}
+    }
+
+    saveTimers(loadTimers().filter(t => !(t.userId === userId && t.roleId === roleId && t.guildId === guildId)));
+  } catch (err) {
+    console.error('[VIP TIMER ERROR]', err);
+  }
+}
+
 // ─── Roblox API ───────────────────────────────────────────────────────────────
 async function getRobloxUserId(username) {
   const res = await fetch('https://users.roblox.com/v1/usernames/users', {
@@ -66,6 +135,12 @@ async function hasGamepass(robloxUserId, gamepassId) {
 client.once('ready', () => {
   console.log(`✅ Bot is online as: ${client.user.tag}`);
   client.user.setActivity('/verify', { type: 2 });
+
+  const timers = loadTimers();
+  for (const timer of timers) {
+    scheduleRoleRemoval(timer.guildId, timer.userId, timer.roleId, timer.expiresAt);
+  }
+  console.log(`🔁 Restored ${timers.length} active VIP timer(s)`);
 });
 
 client.on('interactionCreate', async (interaction) => {
@@ -182,12 +257,24 @@ client.on('interactionCreate', async (interaction) => {
     await interaction.deferReply({ ephemeral: true });
 
     const amount = interaction.options.getInteger('amount') || 1;
+    const durationStr = interaction.options.getString('duration');
+
+    const durationMs = parseDuration(durationStr);
+    if (durationMs === undefined) {
+      return await interaction.editReply({
+        embeds: [new EmbedBuilder()
+          .setColor(0xe74c3c)
+          .setTitle('❌ Invalid Duration')
+          .setDescription('Valid formats:\n`30s` = 30 seconds\n`10m` = 10 minutes\n`1h` = 1 hour\n`2d` = 2 days\n`1w` = 1 week\n`permanent` = forever')]
+      });
+    }
+
     const codes = loadCodes();
     const newCodes = [];
 
     for (let i = 0; i < Math.min(amount, 10); i++) {
       const code = generateCode();
-      codes[code] = { used: false, createdAt: new Date().toISOString() };
+      codes[code] = { used: false, createdAt: new Date().toISOString(), durationMs };
       newCodes.push(code);
     }
 
@@ -198,6 +285,7 @@ client.on('interactionCreate', async (interaction) => {
         .setColor(0x9b59b6)
         .setTitle(`🎟️ Generated ${newCodes.length} VIP Code${newCodes.length > 1 ? 's' : ''}`)
         .setDescription(newCodes.map(c => `\`${c}\``).join('\n'))
+        .addFields({ name: 'Duration', value: formatDuration(durationMs), inline: true })
         .setFooter({ text: 'Share these codes with your users!' })
         .setTimestamp()]
     });
@@ -255,15 +343,38 @@ client.on('interactionCreate', async (interaction) => {
     codes[code].usedAt = new Date().toISOString();
     saveCodes(codes);
 
-    await interaction.editReply({
-      embeds: [new EmbedBuilder()
-        .setColor(0x2ecc71)
-        .setTitle('✅ Code Redeemed!')
-        .setDescription(`You have successfully redeemed the code and received the **${role.name}** role!`)
-        .setTimestamp()]
-    });
+    const durationMs = codes[code].durationMs;
+    let expiresAt = null;
 
-    console.log(`[REDEEM] ${member.user.tag} redeemed code ${code}`);
+    if (durationMs) {
+      expiresAt = Date.now() + durationMs;
+      const timers = loadTimers();
+      timers.push({
+        guildId: interaction.guild.id,
+        userId: member.user.id,
+        roleId: role.id,
+        username: member.user.tag,
+        roleName: role.name,
+        expiresAt
+      });
+      saveTimers(timers);
+      scheduleRoleRemoval(interaction.guild.id, member.user.id, role.id, expiresAt);
+    }
+
+    const embed = new EmbedBuilder()
+      .setColor(0x2ecc71)
+      .setTitle('✅ Code Redeemed!')
+      .setDescription(`You have successfully redeemed the code and received the **${role.name}** role!`)
+      .addFields({ name: 'Duration', value: durationMs ? formatDuration(durationMs) : 'Permanent', inline: true })
+      .setTimestamp();
+
+    if (expiresAt) {
+      embed.addFields({ name: 'Expires', value: `<t:${Math.floor(expiresAt / 1000)}:R>`, inline: true });
+    }
+
+    await interaction.editReply({ embeds: [embed] });
+
+    console.log(`[REDEEM] ${member.user.tag} redeemed code ${code} (duration: ${durationMs ? formatDuration(durationMs) : 'Permanent'})`);
   }
 });
 
